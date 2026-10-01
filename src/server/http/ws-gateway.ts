@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Logger } from 'pino';
 import type WebSocket from 'ws';
 import {
@@ -14,6 +14,7 @@ import type { Room, RoomClient } from '../rooms/room.js';
 import type { RoomRegistry } from '../rooms/room-registry.js';
 import type { TwitchChatClient } from '../twitch/chat-client.js';
 import { TokenBucket } from './rate-limiter.js';
+import { isSameOrigin } from './request-context.js';
 
 export const MAX_WS_PAYLOAD_BYTES = 16 * 1024;
 const HELLO_TIMEOUT_MS = 10_000;
@@ -23,6 +24,7 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 export const CloseCode = {
   BadHello: 4400,
   Unauthorized: 4401,
+  Forbidden: 4403,
   NotFound: 4404,
   HelloTimeout: 4408,
 } as const;
@@ -36,16 +38,19 @@ export interface WsGatewayOptions {
 /**
  * WebSocket endpoint shared by the overlay and host control page.
  *
- * Each connection must first send a `hello` naming its room and role (hosts
- * also present their token — sent in-band rather than in the URL so it never
- * lands in access logs). Afterwards overlays only receive; hosts may send
- * validated, rate-limited game commands.
+ * Each connection must first send a `hello` naming its room and role.
+ * Overlays are public and read-only. Hosts must be signed in (session
+ * cookie), connect from our own origin (blocking cross-site WebSocket
+ * hijacking) and own the room; they may then send validated, rate-limited
+ * game commands.
  */
 export function registerWsGateway(app: FastifyInstance, options: WsGatewayOptions): void {
   const { registry, chat } = options;
   const logger = options.logger.child({ component: 'ws' });
 
-  app.get(WS_PATH, { websocket: true }, (socket: WebSocket) => {
+  app.get(WS_PATH, { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
+    const user = request.user;
+    const trustedOrigin = isSameOrigin(request);
     let session: { room: Room; client: RoomClient; role: ClientRole } | null = null;
     let alive = true;
     const bucket = new TokenBucket(20, 5);
@@ -91,14 +96,23 @@ export function registerWsGateway(app: FastifyInstance, options: WsGatewayOption
           socket.close(CloseCode.BadHello, 'expected hello');
           return;
         }
-        const room =
-          hello.data.role === 'host'
-            ? registry.authenticateHost(hello.data.roomId, hello.data.token)
-            : registry.get(hello.data.roomId);
-        if (!room) {
-          const code = hello.data.role === 'host' ? CloseCode.Unauthorized : CloseCode.NotFound;
-          socket.close(code, hello.data.role === 'host' ? 'unauthorized' : 'room not found');
-          return;
+        let room: Room | undefined;
+        if (hello.data.role === 'host') {
+          if (user === null || !trustedOrigin) {
+            socket.close(CloseCode.Unauthorized, 'sign in required');
+            return;
+          }
+          room = registry.getOwned(hello.data.roomId, user.id);
+          if (!room) {
+            socket.close(CloseCode.Forbidden, 'not your game');
+            return;
+          }
+        } else {
+          room = registry.get(hello.data.roomId);
+          if (!room) {
+            socket.close(CloseCode.NotFound, 'room not found');
+            return;
+          }
         }
         clearTimeout(helloTimer);
         const client: RoomClient = { role: hello.data.role, send };

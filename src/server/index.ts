@@ -1,11 +1,15 @@
 import { pino } from 'pino';
 import { loadConfig } from './config.js';
 import { buildApp } from './http/app.js';
-import { JsonFileStore } from './persistence/json-file-store.js';
-import { RoomRegistry, roomsDocumentSchema } from './rooms/room-registry.js';
+import { AuthService } from './auth/auth-service.js';
+import { SessionRepository } from './auth/session-repository.js';
+import { UserRepository } from './auth/user-repository.js';
+import { openDatabase } from './db/database.js';
+import { RoomRegistry } from './rooms/room-registry.js';
+import { RoomStore } from './rooms/room-store.js';
 import { TwitchChatClient } from './twitch/chat-client.js';
 
-const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 async function main(): Promise<void> {
@@ -17,13 +21,22 @@ async function main(): Promise<void> {
       : {}),
   });
 
+  const db = openDatabase(config.databaseFile, logger);
+  const auth = new AuthService({
+    users: new UserRepository(db),
+    sessions: new SessionRepository(db, { ttlMs: config.sessionTtlMs }),
+    logger,
+    registrationEnabled: config.registrationEnabled,
+    registrationCode: config.registrationCode,
+  });
   const registry = new RoomRegistry({
     logger,
-    store: new JsonFileStore({ filePath: config.dataFile, schema: roomsDocumentSchema, logger }),
+    store: new RoomStore(db),
     retentionMs: config.roomRetentionMs,
     maxRooms: config.maxRooms,
+    maxRoomsPerUser: config.maxRoomsPerUser,
   });
-  await registry.load();
+  registry.load();
 
   const chat = new TwitchChatClient({ logger });
   chat.on('message', (message) => {
@@ -38,9 +51,12 @@ async function main(): Promise<void> {
   chat.on('disconnected', announceChatStatus);
   chat.start();
 
-  const app = await buildApp({ config, registry, chat, logger });
-  const pruneTimer = setInterval(() => registry.prune(), PRUNE_INTERVAL_MS);
-  pruneTimer.unref();
+  const app = await buildApp({ config, auth, registry, chat, logger });
+  const maintenanceTimer = setInterval(() => {
+    registry.prune();
+    auth.pruneExpired();
+  }, MAINTENANCE_INTERVAL_MS);
+  maintenanceTimer.unref();
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -53,10 +69,11 @@ async function main(): Promise<void> {
     }, SHUTDOWN_TIMEOUT_MS);
     forceExit.unref();
 
-    clearInterval(pruneTimer);
+    clearInterval(maintenanceTimer);
     chat.stop();
     await app.close();
-    await registry.shutdown();
+    registry.shutdown();
+    db.close();
     logger.info('Shutdown complete');
     process.exit(0);
   };

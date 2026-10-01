@@ -27,3 +27,6 @@ export function fakeClock(start = 1_700_000_000_000): {
     },
   };
 }
+
+/** Cheap scrypt parameters so tests stay fast. Never use outside tests. */
+export const FAST_SCRYPT = { N: 2 ** 10, r: 8, p: 1 } as const;

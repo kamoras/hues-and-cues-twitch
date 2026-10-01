@@ -23,7 +23,8 @@ body.landing {
 
 .topbar__brand {
   display: flex;
-  align-items: baseline;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 12px;
   font-size: 1.25rem;
 }
@@ -39,6 +40,7 @@ body.landing {
 .topbar__status {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
 }
 
@@ -331,4 +333,93 @@ input.mono {
     transform: translateY(10px);
     opacity: 0;
   }
+}
+
+/* Auth --------------------------------------------------------------------- */
+
+.auth {
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 10vh 16px 48px;
+}
+
+.auth__brand {
+  display: block;
+  margin-bottom: 20px;
+  text-align: center;
+  font-size: 2rem;
+  font-weight: 900;
+  text-decoration: none;
+  background: var(--rainbow);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.auth__card h1 {
+  font-size: 1.5rem;
+}
+
+.auth__card .button[type='submit'] {
+  width: 100%;
+  margin-top: 20px;
+}
+
+.auth__switch {
+  margin: 16px 0 0;
+  text-align: center;
+}
+
+.auth__switch a,
+.topbar__brand a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+.field + .field {
+  margin-top: 4px;
+}
+
+.form-error {
+  margin: 16px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  color: var(--danger);
+  background: rgb(255 107 107 / 0.08);
+}
+
+/* Lobby -------------------------------------------------------------------- */
+
+.lobby {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.room-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.room-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.room-list li:last-child {
+  border-bottom: 0;
+}
+
+.room-list__actions {
+  display: flex;
+  gap: 8px;
 }

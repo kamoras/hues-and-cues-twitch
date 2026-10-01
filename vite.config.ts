@@ -15,6 +15,7 @@ export default defineConfig({
       input: {
         index: resolve(clientRoot, 'index.html'),
         control: resolve(clientRoot, 'control.html'),
+        login: resolve(clientRoot, 'login.html'),
         overlay: resolve(clientRoot, 'overlay.html'),
       },
     },
@@ -25,6 +26,8 @@ export default defineConfig({
       '/api': `http://localhost:${devServerPort}`,
       '/ws': { target: `ws://localhost:${devServerPort}`, ws: true },
       '/healthz': `http://localhost:${devServerPort}`,
+      // Server-side auth redirects for these pages.
+      '^/(control|login)$': `http://localhost:${devServerPort}`,
     },
   },
 });

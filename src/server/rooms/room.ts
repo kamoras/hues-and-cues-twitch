@@ -15,7 +15,7 @@ export interface RoomClient {
 export interface RoomOptions {
   readonly id: string;
   readonly channel: string;
-  readonly hostTokenHash: string;
+  readonly ownerId: number;
   readonly createdAt: number;
   readonly lastActiveAt: number;
   readonly snapshot?: GameSnapshot;
@@ -37,7 +37,7 @@ export interface RoomOptions {
 export class Room {
   public readonly id: string;
   public readonly channel: string;
-  public readonly hostTokenHash: string;
+  public readonly ownerId: number;
   public readonly createdAt: number;
 
   private readonly engine: GameEngine;
@@ -55,7 +55,7 @@ export class Room {
   public constructor(options: RoomOptions) {
     this.id = options.id;
     this.channel = options.channel;
-    this.hostTokenHash = options.hostTokenHash;
+    this.ownerId = options.ownerId;
     this.createdAt = options.createdAt;
     this.lastActive = options.lastActiveAt;
     this.logger = options.logger.child({ room: options.id, channel: options.channel });

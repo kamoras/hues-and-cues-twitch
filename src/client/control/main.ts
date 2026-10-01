@@ -6,13 +6,25 @@ import {
   formatCoord,
 } from '../../shared/board.js';
 import { cellColor } from '../../shared/color.js';
-import type { GameSettings, HostCommand, HostGameState } from '../../shared/protocol.js';
+import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '../../shared/endpoints.js';
+import type {
+  AuthUser,
+  GameSettings,
+  HostCommand,
+  HostGameState,
+  RoomSummary,
+} from '../../shared/protocol.js';
 import { CLUE_WORD_LIMITS, countWords, MAX_CLUE_LENGTH } from '../../shared/rules.js';
 import { BoardView } from '../common/board-view.js';
 import { type Child, formatSeconds, h, replaceChildren, requireElement } from '../common/dom.js';
-import { type ConnectionStatus, GameSocket, ServerClock } from '../common/game-socket.js';
-import { api, ApiError } from './api.js';
-import { clearSession, type HostSession, loadSession, overlayUrl, saveSession } from './session.js';
+import {
+  type ConnectionStatus,
+  GameSocket,
+  ServerClock,
+  UNAUTHORIZED_CLOSE_CODE,
+} from '../common/game-socket.js';
+import { api, ApiError, redirectToLogin } from '../common/api.js';
+import { lastRoom, overlayUrl } from './session.js';
 import { toast } from './toast.js';
 
 const app = requireElement('#app', HTMLElement);
@@ -20,32 +32,81 @@ const app = requireElement('#app', HTMLElement);
 void boot();
 
 async function boot(): Promise<void> {
-  const session = loadSession();
-  if (session === null) {
-    await renderSetup();
-    return;
-  }
   try {
-    await api.getRoom(session.roomId);
-    renderGame(session);
+    const [{ user }, { rooms }] = await Promise.all([api.me(), api.listRooms()]);
+    const remembered = rooms.find((room) => room.roomId === lastRoom.get());
+    const only = rooms.length === 1 ? rooms[0] : undefined;
+    const initial = remembered ?? only;
+    if (initial) renderGame(user, initial);
+    else renderLobby(user, rooms);
   } catch (error) {
-    if (error instanceof ApiError && error.status === 404) {
-      clearSession();
-      toast('Your previous room has expired. Create a new one.', 'error');
-      await renderSetup();
-    } else {
-      // Server unreachable — the socket will keep retrying.
-      renderGame(session);
+    if (error instanceof ApiError && error.status === 401) {
+      redirectToLogin();
+      return;
     }
+    replaceChildren(
+      app,
+      h(
+        'div',
+        { className: 'card setup' },
+        h('h1', { text: 'Can’t reach the server' }),
+        h('p', { className: 'muted', text: 'Check your connection, then try again.' }),
+        h('button', {
+          className: 'button button--primary',
+          text: 'Retry',
+          attrs: { type: 'button' },
+          on: { click: () => void boot() },
+        }),
+      ),
+    );
   }
 }
 
+function handleApiError(error: unknown, fallback: string): void {
+  if (error instanceof ApiError && error.status === 401) {
+    redirectToLogin();
+    return;
+  }
+  toast(error instanceof Error ? error.message : fallback, 'error');
+}
+
+function topbar(user: AuthUser, ...extras: Child[]): HTMLElement {
+  return h(
+    'header',
+    { className: 'topbar' },
+    h(
+      'div',
+      { className: 'topbar__brand' },
+      h('a', { attrs: { href: '/control' } }, h('strong', { text: 'Hues & Cues' })),
+      ...extras,
+    ),
+    h(
+      'div',
+      { className: 'topbar__status' },
+      h('span', { className: 'muted', text: user.username }),
+      h('button', {
+        className: 'button button--ghost button--small',
+        text: 'Sign out',
+        attrs: { type: 'button' },
+        on: {
+          click: () => {
+            void api.logout().finally(() => {
+              lastRoom.clear();
+              window.location.assign('/login');
+            });
+          },
+        },
+      }),
+    ),
+  );
+}
+
 // -----------------------------------------------------------------------------
-// Setup
+// Lobby: list, create and delete games; account settings
 // -----------------------------------------------------------------------------
 
-async function renderSetup(): Promise<void> {
-  const { accessCodeRequired } = await api.getConfig().catch(() => ({ accessCodeRequired: false }));
+function renderLobby(user: AuthUser, rooms: readonly RoomSummary[]): void {
+  lastRoom.clear();
   const channelInput = h('input', {
     attrs: {
       id: 'channel',
@@ -57,59 +118,176 @@ async function renderSetup(): Promise<void> {
       pattern: '#?[A-Za-z0-9_]{3,25}',
     },
   });
-  const codeInput = h('input', {
-    attrs: { id: 'access-code', name: 'accessCode', type: 'password', autocomplete: 'off' },
-  });
   const submit = h('button', {
     className: 'button button--primary',
-    text: 'Create game room',
+    text: 'Start',
+    attrs: { type: 'submit' },
+  });
+  const createForm = h(
+    'form',
+    { className: 'card' },
+    h('h2', { text: rooms.length === 0 ? 'Set up your first game' : 'New game' }),
+    h('p', {
+      className: 'muted',
+      text: 'Enter the Twitch channel whose chat should play. The game only reads public chat — no Twitch login or bot needed.',
+    }),
+    h('label', { attrs: { for: 'channel' }, text: 'Twitch channel' }),
+    h('div', { className: 'clue-form__row' }, channelInput, submit),
+  );
+  createForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    api
+      .createRoom({ channel: channelInput.value })
+      .then(({ room }) => {
+        renderGame(user, room);
+      })
+      .catch((error: unknown) => {
+        handleApiError(error, 'Could not create the game.');
+        submit.disabled = false;
+      });
+  });
+
+  const list = h(
+    'ul',
+    { className: 'room-list' },
+    ...rooms.map((room) =>
+      h(
+        'li',
+        {},
+        h(
+          'div',
+          {},
+          h('strong', { text: `#${room.channel}` }),
+          h('span', {
+            className: 'hint',
+            text: `Last played ${new Date(room.lastActiveAt).toLocaleDateString()}`,
+          }),
+        ),
+        h(
+          'div',
+          { className: 'room-list__actions' },
+          h('button', {
+            className: 'button button--primary button--small',
+            text: 'Open',
+            attrs: { type: 'button' },
+            on: {
+              click: () => {
+                renderGame(user, room);
+              },
+            },
+          }),
+          h('button', {
+            className: 'button button--danger button--small',
+            text: 'Delete',
+            attrs: { type: 'button', 'aria-label': `Delete game for #${room.channel}` },
+            on: {
+              click: () => {
+                if (
+                  !window.confirm(
+                    `Delete the game for #${room.channel}? Its scores and overlay link will stop working.`,
+                  )
+                ) {
+                  return;
+                }
+                api
+                  .deleteRoom(room.roomId)
+                  .then(() => {
+                    renderLobby(
+                      user,
+                      rooms.filter((r) => r.roomId !== room.roomId),
+                    );
+                  })
+                  .catch((error: unknown) => {
+                    handleApiError(error, 'Could not delete the game.');
+                  });
+              },
+            },
+          }),
+        ),
+      ),
+    ),
+  );
+
+  replaceChildren(
+    app,
+    topbar(user),
+    h(
+      'div',
+      { className: 'lobby' },
+      rooms.length > 0 &&
+        h('section', { className: 'card' }, h('h2', { text: 'Your games' }), list),
+      createForm,
+      accountCard(),
+    ),
+  );
+  if (rooms.length === 0) channelInput.focus();
+}
+
+function accountCard(): HTMLElement {
+  const current = h('input', {
+    attrs: {
+      id: 'current-password',
+      type: 'password',
+      required: '',
+      autocomplete: 'current-password',
+    },
+  });
+  const next = h('input', {
+    attrs: {
+      id: 'new-password',
+      type: 'password',
+      required: '',
+      minlength: String(PASSWORD_MIN_LENGTH),
+      maxlength: String(PASSWORD_MAX_LENGTH),
+      autocomplete: 'new-password',
+    },
+  });
+  const submit = h('button', {
+    className: 'button',
+    text: 'Change password',
     attrs: { type: 'submit' },
   });
   const form = h(
     'form',
-    { className: 'card setup' },
-    h('h1', { text: 'Set up Hues & Cues' }),
-    h('p', {
-      className: 'muted',
-      text: 'Enter the Twitch channel whose chat should play. No Twitch login is needed — the game only reads public chat.',
+    { className: 'card' },
+    h('h2', { text: 'Account' }),
+    h('label', { attrs: { for: current.id }, text: 'Current password' }),
+    current,
+    h('label', { attrs: { for: next.id }, text: 'New password' }),
+    next,
+    h('span', {
+      className: 'hint',
+      text: `At least ${String(PASSWORD_MIN_LENGTH)} characters. Other devices will be signed out.`,
     }),
-    h('label', { attrs: { for: 'channel' }, text: 'Twitch channel' }),
-    channelInput,
-    accessCodeRequired && h('label', { attrs: { for: 'access-code' }, text: 'Access code' }),
-    accessCodeRequired && codeInput,
-    submit,
+    h('div', { className: 'actions' }, submit),
   );
   form.addEventListener('submit', (event) => {
     event.preventDefault();
+    if (!form.reportValidity()) return;
     submit.disabled = true;
     api
-      .createRoom({
-        channel: channelInput.value,
-        ...(accessCodeRequired ? { accessCode: codeInput.value } : {}),
-      })
-      .then((room) => {
-        const session: HostSession = {
-          roomId: room.roomId,
-          hostToken: room.hostToken,
-          channel: room.channel,
-        };
-        saveSession(session);
-        renderGame(session);
+      .changePassword({ currentPassword: current.value, newPassword: next.value })
+      .then(() => {
+        form.reset();
+        toast('Password changed.');
       })
       .catch((error: unknown) => {
-        toast(error instanceof Error ? error.message : 'Could not create the room.', 'error');
+        handleApiError(error, 'Could not change your password.');
+      })
+      .finally(() => {
         submit.disabled = false;
       });
   });
-  replaceChildren(app, form);
-  channelInput.focus();
+  return form;
 }
 
 // -----------------------------------------------------------------------------
 // Game
 // -----------------------------------------------------------------------------
 
-function renderGame(session: HostSession): void {
+function renderGame(user: AuthUser, room: RoomSummary): void {
+  lastRoom.set(room.roomId);
   const clock = new ServerClock();
   let state: HostGameState | null = null;
   let phaseKey = '';
@@ -132,18 +310,13 @@ function renderGame(session: HostSession): void {
   const chatStatus = h('span', { className: 'pill' });
   const overlayInput = h('input', {
     className: 'mono',
-    attrs: { readonly: '', value: overlayUrl(session), 'aria-label': 'Overlay URL' },
+    attrs: { readonly: '', value: overlayUrl(room.roomId), 'aria-label': 'Overlay URL' },
   });
-  const header = h(
-    'header',
-    { className: 'topbar' },
-    h(
-      'div',
-      { className: 'topbar__brand' },
-      h('strong', { text: 'Hues & Cues' }),
-      h('span', { className: 'muted', text: `#${session.channel}` }),
-    ),
-    h('div', { className: 'topbar__status' }, connection, chatStatus),
+  const header = topbar(
+    user,
+    h('span', { className: 'muted', text: `#${room.channel}` }),
+    connection,
+    chatStatus,
   );
 
   const overlayCard = h(
@@ -178,7 +351,7 @@ function renderGame(session: HostSession): void {
       h('a', {
         className: 'button',
         text: 'Preview',
-        attrs: { href: `${overlayUrl(session)}&bg=solid`, target: '_blank', rel: 'noopener' },
+        attrs: { href: `${overlayUrl(room.roomId)}&bg=solid`, target: '_blank', rel: 'noopener' },
       }),
     ),
     h('p', {
@@ -257,23 +430,24 @@ function renderGame(session: HostSession): void {
     }),
   );
 
-  const forget = h('button', {
+  const backToLobby = (): void => {
+    socket.close();
+    window.clearInterval(liveTimer);
+    lastRoom.clear();
+    api
+      .listRooms()
+      .then(({ rooms }) => {
+        renderLobby(user, rooms);
+      })
+      .catch((error: unknown) => {
+        handleApiError(error, 'Could not load your games.');
+      });
+  };
+  const allGames = h('button', {
     className: 'button button--ghost button--small',
-    text: 'Switch channel / forget this room',
+    text: 'All games & account',
     attrs: { type: 'button' },
-    on: {
-      click: () => {
-        if (
-          !window.confirm(
-            'Forget this room on this browser? Your overlay URL will stop working for you to control.',
-          )
-        )
-          return;
-        socket.close();
-        clearSession();
-        void renderSetup();
-      },
-    },
+    on: { click: backToLobby },
   });
 
   replaceChildren(
@@ -295,7 +469,7 @@ function renderGame(session: HostSession): void {
         scoresCard,
         settingsForm.element,
         testCard,
-        forget,
+        allGames,
       ),
     ),
   );
@@ -352,17 +526,21 @@ function renderGame(session: HostSession): void {
     renderLiveInfo();
   };
 
-  const setConnection = (status: ConnectionStatus, detail?: string): void => {
+  const setConnection = (status: ConnectionStatus, detail?: string, code?: number): void => {
     connection.textContent =
       status === 'open' ? 'Server connected' : status === 'failed' ? 'Disconnected' : 'Connecting…';
     connection.dataset.state = status === 'open' ? 'ok' : status === 'failed' ? 'bad' : 'warn';
-    if (status === 'failed') {
-      toast(detail ?? 'Disconnected from the server.', 'error');
+    if (status !== 'failed') return;
+    if (code === UNAUTHORIZED_CLOSE_CODE) {
+      redirectToLogin();
+      return;
     }
+    toast(detail ?? 'Disconnected from the server.', 'error');
+    backToLobby();
   };
 
   const socket = new GameSocket<HostGameState>(
-    { type: 'hello', role: 'host', roomId: session.roomId, token: session.hostToken },
+    { type: 'hello', role: 'host', roomId: room.roomId },
     {
       onState: (next, serverTime) => {
         clock.sync(serverTime);
@@ -379,7 +557,7 @@ function renderGame(session: HostSession): void {
     },
   );
   socket.connect();
-  window.setInterval(renderLiveInfo, 500);
+  const liveTimer = window.setInterval(renderLiveInfo, 500);
 }
 
 function phaseLabel(phase: HostGameState['phase']): string {

@@ -7,6 +7,12 @@
  */
 import { z } from 'zod';
 import { BOARD_COLUMNS, BOARD_ROWS, type Coord } from './board.js';
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+} from './endpoints.js';
 import { CARD_SIZE, MAX_CLUE_LENGTH } from './rules.js';
 
 export { WS_PATH } from './endpoints.js';
@@ -56,12 +62,8 @@ const roomIdSchema = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/u);
 
 export const helloMessageSchema = z.discriminatedUnion('role', [
   z.object({ type: z.literal('hello'), role: z.literal('overlay'), roomId: roomIdSchema }),
-  z.object({
-    type: z.literal('hello'),
-    role: z.literal('host'),
-    roomId: roomIdSchema,
-    token: z.string().min(16).max(256),
-  }),
+  // Hosts are authenticated by their session cookie; the room must be theirs.
+  z.object({ type: z.literal('hello'), role: z.literal('host'), roomId: roomIdSchema }),
 ]);
 export type HelloMessage = z.infer<typeof helloMessageSchema>;
 
@@ -151,7 +153,14 @@ export interface HostGameState extends PublicGameState {
 }
 
 export type ErrorCode =
-  'bad_request' | 'unauthorized' | 'not_found' | 'invalid_state' | 'rate_limited' | 'internal';
+  | 'bad_request'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not_found'
+  | 'conflict'
+  | 'invalid_state'
+  | 'rate_limited'
+  | 'internal';
 
 export type ServerMessage =
   | { readonly type: 'welcome'; readonly role: ClientRole; readonly serverTime: number }
@@ -170,26 +179,77 @@ export type ServerMessage =
   | { readonly type: 'chatStatus'; readonly connected: boolean }
   | { readonly type: 'error'; readonly code: ErrorCode; readonly message: string };
 
-/** REST: request body for `POST /api/rooms`. */
-export const createRoomRequestSchema = z.object({
-  channel: z
-    .string()
-    .trim()
-    .transform((value) => value.replace(/^#/u, '').toLowerCase())
-    .pipe(z.string().regex(/^[a-z0-9_]{3,25}$/u, 'Not a valid Twitch channel name')),
-  accessCode: z.string().max(256).optional(),
-});
+// -----------------------------------------------------------------------------
+// REST API
+// -----------------------------------------------------------------------------
+
+export const channelSchema = z
+  .string()
+  .trim()
+  .transform((value) => value.replace(/^#/u, '').toLowerCase())
+  .pipe(z.string().regex(/^[a-z0-9_]{3,25}$/u, 'Not a valid Twitch channel name.'));
+
+/** `POST /api/rooms` */
+export const createRoomRequestSchema = z.object({ channel: channelSchema });
 export type CreateRoomRequest = z.input<typeof createRoomRequestSchema>;
 
-export interface CreateRoomResponse {
+export interface RoomSummary {
   readonly roomId: string;
-  readonly hostToken: string;
   readonly channel: string;
+  readonly createdAt: number;
+  readonly lastActiveAt: number;
 }
 
-export interface RoomInfoResponse {
-  readonly roomId: string;
-  readonly channel: string;
+export const usernameSchema = z
+  .string()
+  .trim()
+  .regex(
+    new RegExp(
+      `^[A-Za-z0-9_-]{${String(USERNAME_MIN_LENGTH)},${String(USERNAME_MAX_LENGTH)}}$`,
+      'u',
+    ),
+    `Usernames are ${String(USERNAME_MIN_LENGTH)}–${String(USERNAME_MAX_LENGTH)} letters, numbers, _ or -.`,
+  );
+
+/**
+ * Length is the only composition rule, per NIST SP 800-63B: any characters
+ * (including spaces and emoji) are allowed, and long passphrases are welcome.
+ */
+export const newPasswordSchema = z
+  .string()
+  .min(PASSWORD_MIN_LENGTH, `Passwords must be at least ${String(PASSWORD_MIN_LENGTH)} characters.`)
+  .max(PASSWORD_MAX_LENGTH, `Passwords must be at most ${String(PASSWORD_MAX_LENGTH)} characters.`);
+
+/** `POST /api/auth/register` */
+export const registerRequestSchema = z.object({
+  username: usernameSchema,
+  password: newPasswordSchema,
+  registrationCode: z.string().max(256).optional(),
+});
+export type RegisterRequest = z.input<typeof registerRequestSchema>;
+
+/** `POST /api/auth/login` — deliberately loose: never reveal which rule failed. */
+export const loginRequestSchema = z.object({
+  username: z.string().trim().min(1).max(64),
+  password: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+});
+export type LoginRequest = z.input<typeof loginRequestSchema>;
+
+/** `POST /api/auth/password` */
+export const changePasswordRequestSchema = z.object({
+  currentPassword: z.string().min(1).max(PASSWORD_MAX_LENGTH),
+  newPassword: newPasswordSchema,
+});
+export type ChangePasswordRequest = z.input<typeof changePasswordRequestSchema>;
+
+export interface AuthUser {
+  readonly id: number;
+  readonly username: string;
+}
+
+export interface PublicConfigResponse {
+  readonly registrationOpen: boolean;
+  readonly registrationCodeRequired: boolean;
 }
 
 export interface ApiErrorResponse {

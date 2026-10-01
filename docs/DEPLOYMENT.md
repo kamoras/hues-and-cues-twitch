@@ -1,93 +1,126 @@
-# Deploying to Oracle Cloud (Always Free)
+# Deployment
 
-These steps give you an always-on HTTPS server at no cost. Allow about 20 minutes.
+Production runs on the **same Oracle Cloud VM as
+[dead-by-daylight-twitch-bot](https://github.com/kamoras/dead-by-daylight-twitch-bot)**, deployed by
+GitHub Actions in the same way: every push to `main` that passes CI is built into a multi-arch image,
+pushed to GHCR and rolled out over SSH.
 
-## Why not Vercel?
+## How the two apps share the VM
 
-Vercel runs code as short-lived serverless functions. This game needs a process that stays
-connected to Twitch chat and pushes live updates to your OBS overlay over WebSockets, which Vercel
-does not support. Any small always-on server works; Oracle's free tier is the most generous.
-
-## 1. Create the VM
-
-1. Sign up at <https://www.oracle.com/cloud/free/>.
-2. **Compute → Instances → Create instance**.
-   - Image: **Canonical Ubuntu 24.04**.
-   - Shape: **Ampere VM.Standard.A1.Flex** (1 OCPU / 6 GB is plenty) or **VM.Standard.E2.1.Micro**.
-   - Add your SSH public key.
-3. Note the instance's **public IP address**.
-
-## 2. Open ports 80 and 443
-
-Oracle blocks traffic in two places — both must be opened.
-
-**Cloud firewall:** Instance → _Subnet_ → _Security Lists_ → default list → **Add Ingress Rules**:
-source `0.0.0.0/0`, TCP, destination ports `80,443`.
-
-**Instance firewall** (Ubuntu images ship with restrictive iptables rules):
-
-```bash
-ssh ubuntu@<public-ip>
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
-sudo netfilter-persistent save
+```
+                    Internet :80/:443
+                           │
+                ┌──────────▼───────────┐
+                │ dbd-caddy (Caddy)    │  owned by dead-by-daylight-twitch-bot
+                │  bot.example.com ────┼──► bot:8080           (dbd default network)
+                │  hues.example.com ───┼──► hues-and-cues:8080 (shared `edge` network)
+                └──────────────────────┘
+                 imports /opt/caddy/sites/*.caddy
 ```
 
-## 3. Install Docker
+Only one process can bind ports 80/443, and the bot's Caddy already does. So this app runs no proxy
+of its own. Instead:
 
-```bash
-curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker $USER && newgrp docker
-```
+1. Its container joins a shared Docker network named `edge` (alias `hues-and-cues`).
+2. The deploy writes `/opt/caddy/sites/hues-and-cues.caddy` (generated from
+   [`deploy/caddy-site.caddy`](../deploy/caddy-site.caddy)).
+3. The deploy reloads the bot's Caddy, which imports that file and obtains a TLS certificate for this
+   app's hostname automatically.
 
-## 4. Pick a hostname
+The bot repo's side of this (importing `/opt/caddy/sites`, joining `edge`) was added in
+[kamoras/dead-by-daylight-twitch-bot#19](https://github.com/kamoras/dead-by-daylight-twitch-bot/pull/19).
+**Merge and deploy that first.**
 
-HTTPS requires a hostname. If you don't have a domain, use the free
-[sslip.io](https://sslip.io) wildcard DNS: for IP `203.0.113.7` use `203-0-113-7.sslip.io`.
-With your own domain, create an `A` record pointing at the VM's IP.
+| Path on the VM                          | Contents                                   |
+| --------------------------------------- | ------------------------------------------ |
+| `/opt/hues-and-cues/docker-compose.yml` | Copied from `deploy/` on each deploy       |
+| `/opt/hues-and-cues/.env`               | Written from GitHub secrets on each deploy |
+| `/opt/hues-and-cues/data/hues.db`       | SQLite database: accounts, games, scores   |
+| `/opt/caddy/sites/hues-and-cues.caddy`  | Caddy site for this app                    |
 
-## 5. Deploy
+## One-time setup
 
-```bash
-git clone https://github.com/kamoras/hues-and-cues-twitch.git
-cd hues-and-cues-twitch
-cp .env.example .env
-nano .env                     # set DOMAIN and ACCESS_CODE (optionally ALLOWED_CHANNELS)
-docker compose up -d --build
-```
+The VM is already provisioned with Docker and open ports for the bot, so only these steps are needed.
 
-Visit `https://<your-hostname>/control`. Caddy obtains the certificate on the first request
-(this can take ~30 seconds).
+### 1. DNS
+
+Choose a hostname for the game, such as `hues.yourdomain.com`, and create an **A record** pointing to
+the VM's public IP (the same IP as the bot's domain).
+
+### 2. GitHub Actions secrets
+
+In this repository go to **Settings → Secrets and variables → Actions** and add:
+
+| Secret                 | Required | Value                                                                 |
+| ---------------------- | :------: | --------------------------------------------------------------------- |
+| `ORACLE_HOST`          |    ✅    | Same value as in the bot repo                                         |
+| `ORACLE_USER`          |    ✅    | Same value as in the bot repo (`ubuntu`)                              |
+| `ORACLE_SSH_KEY`       |    ✅    | Same private deploy key as in the bot repo                            |
+| `DOMAIN`               |    ✅    | This app's hostname, e.g. `hues.yourdomain.com` (**not** the bot's)   |
+| `REGISTRATION_CODE`    |          | Require this code to sign up. Recommended: only people you invite     |
+| `REGISTRATION_ENABLED` |          | `false` to close sign-ups entirely (existing users can still sign in) |
+| `ALLOWED_CHANNELS`     |          | Comma-separated Twitch channels that may run games                    |
+
+GitHub secrets belong to one repository, so the three `ORACLE_*` values must be copied over from the
+bot repo.
+
+### 3. Deploy
+
+Merge to `main`. The **Deploy** workflow runs after CI passes. It:
+
+1. Builds `linux/amd64` and `linux/arm64` images and pushes them to
+   `ghcr.io/kamoras/hues-and-cues-twitch` (tagged `latest` and `sha-<commit>`).
+2. Over SSH, creates `/opt/hues-and-cues`, the `edge` network and `/opt/caddy/sites` (each only if
+   missing).
+3. Writes `.env` and the Caddy site file, pulls the image and runs `docker compose up -d`.
+4. Waits for the container's health check, then reloads the shared Caddy.
+5. Smoke-tests `https://$DOMAIN/healthz` from the runner.
+
+You can also run it by hand from **Actions → Deploy → Run workflow**.
+
+Then open `https://<DOMAIN>`, create your account and set up your game.
 
 ## Operations
 
-| Task              | Command                                                      |
-| ----------------- | ------------------------------------------------------------ |
-| View logs         | `docker compose logs -f app`                                 |
-| Update            | `git pull && docker compose up -d --build`                   |
-| Health            | `curl https://<host>/healthz`                                |
-| Back up game data | `docker compose cp app:/data/rooms.json ./rooms-backup.json` |
+| Task                 | Command on the VM                                                              |
+| -------------------- | ------------------------------------------------------------------------------ |
+| Logs                 | `sudo docker compose -f /opt/hues-and-cues/docker-compose.yml logs -f`         |
+| Restart              | `sudo docker compose -f /opt/hues-and-cues/docker-compose.yml restart`         |
+| Health               | `curl https://<DOMAIN>/healthz`                                                |
+| Back up the database | `sudo sqlite3 /opt/hues-and-cues/data/hues.db ".backup /tmp/hues-backup.db"`   |
+| Roll back            | Set `image:` to a `sha-…` tag in the compose file, then `docker compose up -d` |
+| Caddy logs           | `sudo docker logs dbd-caddy`                                                   |
 
-Rooms and scores live in the `app-data` Docker volume and survive restarts and upgrades.
+The database uses SQLite in WAL mode; the `.backup` command above gives a consistent copy while the
+app is running. (Install the CLI with `sudo apt-get install sqlite3`.)
 
-## Running without Docker
+## Troubleshooting
 
-Install Node.js 22, then:
+- **Smoke test fails but the container is healthy.** Check that the DNS record points at the VM, and
+  that the bot repo change above has been deployed: `sudo docker exec dbd-caddy ls /etc/caddy/sites`
+  should list `hues-and-cues.caddy`. Then look at `sudo docker logs dbd-caddy` for certificate errors.
+- **`network edge declared as external, but could not be found`.** Run
+  `sudo docker network create edge`. Both deploy workflows normally do this.
+- **Permission denied writing `/data`.** Run `sudo chown -R 1000:1000 /opt/hues-and-cues/data`.
+
+## Other hosting options
+
+The image runs anywhere Docker does. For a machine of your own with nothing else on ports 80/443,
+[`compose.yaml`](../compose.yaml) runs the app behind its own Caddy:
 
 ```bash
-sudo useradd --system --home /opt/hues-and-cues-twitch hues
-sudo git clone https://github.com/kamoras/hues-and-cues-twitch.git /opt/hues-and-cues-twitch
-cd /opt/hues-and-cues-twitch && sudo npm ci && sudo npm run build && sudo npm prune --omit=dev
-sudo cp deploy/hues-and-cues.service /etc/systemd/system/
-echo "ACCESS_CODE=change-me" | sudo tee /etc/hues-and-cues.env
-sudo systemctl daemon-reload && sudo systemctl enable --now hues-and-cues
+cp .env.example .env   # set DOMAIN and, ideally, REGISTRATION_CODE
+docker compose up -d --build
 ```
 
-Put any TLS-terminating reverse proxy (Caddy, nginx) in front and set `TRUST_PROXY=true`.
+Without Docker, [`deploy/hues-and-cues.service`](../deploy/hues-and-cues.service) is a hardened
+systemd unit; run it behind any TLS-terminating proxy with `TRUST_PROXY=true`.
+
+Serverless platforms such as Vercel are **not** suitable. The app needs a long-running process that
+stays connected to Twitch chat and pushes live updates to the overlay over WebSockets.
 
 ## OBS setup
 
-1. In the control panel, copy the **overlay URL**.
-2. OBS → _Sources_ → **+** → _Browser_. Paste the URL; set width **1920** and height **1080**.
-3. Leave _Custom CSS_ as default — the overlay background is already transparent.
-4. Optionally enable _Refresh browser when scene becomes active_.
+1. Open the control panel and copy the **overlay URL**.
+2. In OBS, go to _Sources_ → **+** → _Browser_, paste the URL and set the size to **1920 × 1080**.
+3. The overlay background is already transparent, so leave the default custom CSS alone.

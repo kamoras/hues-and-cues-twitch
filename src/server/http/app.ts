@@ -1,47 +1,45 @@
 import { existsSync } from 'node:fs';
+import fastifyCookie from '@fastify/cookie';
 import fastifyHelmet from '@fastify/helmet';
 import fastifyRateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import type { Logger } from 'pino';
-import {
-  type ApiErrorResponse,
-  type CreateRoomResponse,
-  createRoomRequestSchema,
-  type RoomInfoResponse,
-} from '../../shared/protocol.js';
+import type { AuthService } from '../auth/auth-service.js';
 import type { AppConfig } from '../config.js';
-import { RoomLimitError, type RoomRegistry } from '../rooms/room-registry.js';
-import { safeEqual } from '../rooms/tokens.js';
+import type { RoomRegistry } from '../rooms/room-registry.js';
 import type { TwitchChatClient } from '../twitch/chat-client.js';
+import { registerAuthRoutes } from './auth-routes.js';
+import {
+  type CookieSettings,
+  isSameOrigin,
+  sendError,
+  sessionCookieName,
+} from './request-context.js';
+import { registerRoomRoutes } from './room-routes.js';
 import { MAX_WS_PAYLOAD_BYTES, registerWsGateway } from './ws-gateway.js';
 
 export interface AppDependencies {
   readonly config: Pick<
     AppConfig,
-    'accessCode' | 'allowedChannels' | 'publicDir' | 'trustProxy' | 'env'
+    'allowedChannels' | 'publicDir' | 'trustProxy' | 'env' | 'cookieSecure' | 'sessionTtlMs'
   >;
+  readonly auth: AuthService;
   readonly registry: RoomRegistry;
   readonly chat: Pick<TwitchChatClient, 'acquire' | 'release' | 'connected'>;
   readonly logger: Logger;
 }
 
-/** Pages served from the client build, keyed by their clean URL. */
-const PAGES: Readonly<Record<string, string>> = {
-  '/': 'index.html',
-  '/control': 'control.html',
-  '/overlay': 'overlay.html',
-};
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> {
-  const { config, registry, chat } = deps;
+  const { config, auth, registry, chat } = deps;
+  const cookies: CookieSettings = { secure: config.cookieSecure, ttlMs: config.sessionTtlMs };
+  const cookieName = sessionCookieName(cookies.secure);
+
   const loggerInstance: FastifyBaseLogger = deps.logger;
-  const app = Fastify({
-    loggerInstance,
-    trustProxy: config.trustProxy,
-    bodyLimit: 4 * 1024,
-  });
+  const app = Fastify({ loggerInstance, trustProxy: config.trustProxy, bodyLimit: 8 * 1024 });
 
   await app.register(fastifyHelmet, {
     contentSecurityPolicy: {
@@ -55,11 +53,27 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
         upgradeInsecureRequests: null,
       },
     },
-    // OBS's browser source is not cross-origin isolated; keep defaults permissive enough.
     crossOriginEmbedderPolicy: false,
   });
+  await app.register(fastifyCookie);
   await app.register(fastifyRateLimit, { global: false });
   await app.register(fastifyWebsocket, { options: { maxPayload: MAX_WS_PAYLOAD_BYTES } });
+
+  app.decorateRequest('user', null);
+  app.decorateRequest('sessionToken', null);
+  app.addHook('onRequest', async (request, reply) => {
+    // CSRF defence: state-changing requests must come from our own pages.
+    // (SameSite=Lax cookies are the first line; this covers older browsers.)
+    if (!SAFE_METHODS.has(request.method) && !isSameOrigin(request)) {
+      return sendError(reply, 403, 'forbidden', 'Cross-site request blocked.');
+    }
+    const token = request.cookies[cookieName];
+    if (token) {
+      request.sessionToken = token;
+      request.user = auth.resolveSession(token) ?? null;
+    }
+    return undefined;
+  });
 
   app.setErrorHandler((error, request, reply) => {
     const statusCode =
@@ -68,12 +82,12 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
         : 500;
     if (statusCode >= 500) {
       request.log.error({ err: error }, 'Unhandled error');
+      return sendError(reply, statusCode, 'internal', 'Internal server error');
     }
-    const body: ApiErrorResponse = {
-      error: statusCode >= 500 ? 'Internal server error' : (error as Error).message,
-      code: statusCode === 429 ? 'rate_limited' : statusCode >= 500 ? 'internal' : 'bad_request',
-    };
-    return reply.status(statusCode).send(body);
+    if (statusCode === 429) {
+      return sendError(reply, 429, 'rate_limited', 'Too many requests. Please wait a moment.');
+    }
+    return sendError(reply, statusCode, 'bad_request', (error as Error).message);
   });
 
   // Health checks run every few seconds; keep them out of the request log.
@@ -83,60 +97,8 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
     rooms: registry.size,
   }));
 
-  app.post(
-    '/api/rooms',
-    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
-    async (request, reply) => {
-      const parsed = createRoomRequestSchema.safeParse(request.body);
-      if (!parsed.success) {
-        const message = parsed.error.issues[0]?.message ?? 'Invalid request';
-        return reply
-          .status(400)
-          .send({ error: message, code: 'bad_request' } satisfies ApiErrorResponse);
-      }
-      const { channel, accessCode } = parsed.data;
-      if (config.accessCode !== undefined && !safeEqual(accessCode ?? '', config.accessCode)) {
-        return reply.status(401).send({
-          error: 'Incorrect access code.',
-          code: 'unauthorized',
-        } satisfies ApiErrorResponse);
-      }
-      if (config.allowedChannels && !config.allowedChannels.includes(channel)) {
-        return reply.status(403).send({
-          error: 'This server is not configured for that channel.',
-          code: 'unauthorized',
-        } satisfies ApiErrorResponse);
-      }
-      try {
-        const { room, hostToken } = registry.create(channel);
-        return await reply.status(201).send({
-          roomId: room.id,
-          hostToken,
-          channel: room.channel,
-        } satisfies CreateRoomResponse);
-      } catch (error) {
-        if (error instanceof RoomLimitError) {
-          return reply
-            .status(503)
-            .send({ error: error.message, code: 'internal' } satisfies ApiErrorResponse);
-        }
-        throw error;
-      }
-    },
-  );
-
-  app.get<{ Params: { roomId: string } }>('/api/rooms/:roomId', (request, reply) => {
-    const room = registry.get(request.params.roomId);
-    if (!room) {
-      return reply
-        .status(404)
-        .send({ error: 'Room not found.', code: 'not_found' } satisfies ApiErrorResponse);
-    }
-    return { roomId: room.id, channel: room.channel } satisfies RoomInfoResponse;
-  });
-
-  app.get('/api/config', () => ({ accessCodeRequired: config.accessCode !== undefined }));
-
+  registerAuthRoutes(app, auth, cookies);
+  registerRoomRoutes(app, { registry, allowedChannels: config.allowedChannels });
   registerWsGateway(app, { registry, chat, logger: deps.logger });
 
   if (existsSync(config.publicDir)) {
@@ -153,9 +115,23 @@ export async function buildApp(deps: AppDependencies): Promise<FastifyInstance> 
         }
       },
     });
-    for (const [url, file] of Object.entries(PAGES)) {
-      app.get(url, (_request, reply) => reply.header('Cache-Control', 'no-cache').sendFile(file));
-    }
+
+    app.get('/', (_request, reply) =>
+      reply.header('Cache-Control', 'no-cache').sendFile('index.html'),
+    );
+    app.get('/overlay', (_request, reply) =>
+      reply.header('Cache-Control', 'no-cache').sendFile('overlay.html'),
+    );
+    app.get('/login', (request, reply) =>
+      request.user
+        ? reply.redirect('/control')
+        : reply.header('Cache-Control', 'no-cache').sendFile('login.html'),
+    );
+    app.get('/control', (request, reply) =>
+      request.user
+        ? reply.header('Cache-Control', 'no-store').sendFile('control.html')
+        : reply.redirect('/login?next=%2Fcontrol'),
+    );
   } else {
     deps.logger.warn(
       { publicDir: config.publicDir },

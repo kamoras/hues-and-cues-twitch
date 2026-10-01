@@ -34,7 +34,7 @@ describe('Room', () => {
     room = new Room({
       id: 'room-1',
       channel: 'streamer',
-      hostTokenHash: 'x',
+      ownerId: 1,
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
       logger: silentLogger,
@@ -133,7 +133,7 @@ describe('Room', () => {
     const restored = new Room({
       id: 'room-2',
       channel: 'streamer',
-      hostTokenHash: 'x',
+      ownerId: 1,
       createdAt: 0,
       lastActiveAt: 0,
       snapshot,

@@ -26,10 +26,12 @@
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run test"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.2",
     "@fastify/helmet": "^13.1.1",
     "@fastify/rate-limit": "^11.2.0",
     "@fastify/static": "^10.1.5",
     "@fastify/websocket": "^11.3.1",
+    "better-sqlite3": "^13.0.3",
     "fastify": "^5.12.5",
     "pino": "^10.3.1",
     "ws": "^8.22.0",
@@ -37,6 +39,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.20.4",
     "@types/ws": "^8.18.2",
     "@vitest/coverage-v8": "^5.0.3",

@@ -2,14 +2,15 @@ import type { AddressInfo } from 'node:net';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
-import type {
-  CreateRoomResponse,
-  HostGameState,
-  ServerMessage,
-} from '../../src/shared/protocol.js';
+import type { HostGameState, RoomSummary, ServerMessage } from '../../src/shared/protocol.js';
+import { AuthService } from '../../src/server/auth/auth-service.js';
+import { SessionRepository } from '../../src/server/auth/session-repository.js';
+import { UserRepository } from '../../src/server/auth/user-repository.js';
+import { type Db, openDatabase } from '../../src/server/db/database.js';
 import { buildApp } from '../../src/server/http/app.js';
 import { RoomRegistry } from '../../src/server/rooms/room-registry.js';
-import { silentLogger } from '../helpers.js';
+import { RoomStore } from '../../src/server/rooms/room-store.js';
+import { FAST_SCRYPT, silentLogger } from '../helpers.js';
 
 class FakeChat {
   public connected = true;
@@ -43,8 +44,11 @@ class TestClient {
     });
   }
 
-  public static async connect(url: string): Promise<TestClient> {
-    const socket = new WebSocket(url);
+  public static async connect(
+    url: string,
+    headers: Record<string, string> = {},
+  ): Promise<TestClient> {
+    const socket = new WebSocket(url, { headers });
     const client = new TestClient(socket);
     await new Promise<void>((resolve, reject) => {
       socket.once('open', () => resolve());
@@ -95,41 +99,90 @@ class TestClient {
   }
 }
 
+interface SetupOptions {
+  registrationEnabled?: boolean;
+  registrationCode?: string;
+  allowedChannels?: string[];
+  maxRoomsPerUser?: number;
+}
+
 describe('HTTP + WebSocket API', () => {
   let app: FastifyInstance;
+  let db: Db;
   let registry: RoomRegistry;
   let chat: FakeChat;
+  let origin: string;
   let wsUrl: string;
   const clients: TestClient[] = [];
 
-  const setup = async (config: { accessCode?: string; allowedChannels?: string[] } = {}) => {
-    registry = new RoomRegistry({ logger: silentLogger, retentionMs: 60_000, maxRooms: 3 });
+  const setup = async (options: SetupOptions = {}) => {
+    db = openDatabase(':memory:', silentLogger);
+    const auth = new AuthService({
+      users: new UserRepository(db),
+      sessions: new SessionRepository(db, { ttlMs: 60_000 }),
+      logger: silentLogger,
+      registrationEnabled: options.registrationEnabled ?? true,
+      registrationCode: options.registrationCode,
+      scryptParams: FAST_SCRYPT,
+    });
+    registry = new RoomRegistry({
+      logger: silentLogger,
+      store: new RoomStore(db),
+      retentionMs: 60_000,
+      maxRooms: 100,
+      maxRoomsPerUser: options.maxRoomsPerUser ?? 5,
+    });
     chat = new FakeChat();
     app = await buildApp({
       config: {
-        accessCode: config.accessCode,
-        allowedChannels: config.allowedChannels,
+        allowedChannels: options.allowedChannels,
         publicDir: '/nonexistent',
         trustProxy: false,
         env: 'test',
+        cookieSecure: false,
+        sessionTtlMs: 60_000,
       },
+      auth,
       registry,
       chat,
       logger: silentLogger,
     });
     await app.listen({ host: '127.0.0.1', port: 0 });
     const { port } = app.server.address() as AddressInfo;
+    origin = `http://127.0.0.1:${String(port)}`;
     wsUrl = `ws://127.0.0.1:${String(port)}/ws`;
   };
 
-  const createRoom = async (channel = 'Streamer'): Promise<CreateRoomResponse> => {
-    const response = await app.inject({ method: 'POST', url: '/api/rooms', payload: { channel } });
+  /** Sends a same-origin request, optionally with a session cookie. */
+  const call = (
+    method: 'GET' | 'POST' | 'DELETE',
+    url: string,
+    payload?: unknown,
+    cookie?: string,
+  ) =>
+    app.inject({
+      method,
+      url,
+      headers: { origin, host: new URL(origin).host, ...(cookie ? { cookie } : {}) },
+      ...(payload === undefined ? {} : { payload: payload as Record<string, unknown> }),
+    });
+
+  const register = async (username = 'streamer', password = 'a good password') => {
+    const response = await call('POST', '/api/auth/register', { username, password });
     expect(response.statusCode).toBe(201);
-    return response.json<CreateRoomResponse>();
+    const cookie = response.cookies.find((c) => c.name === 'hc_session');
+    if (!cookie) throw new Error('no session cookie');
+    return `${cookie.name}=${cookie.value}`;
   };
 
-  const connect = async (hello: Record<string, unknown>): Promise<TestClient> => {
-    const client = await TestClient.connect(wsUrl);
+  const createRoom = async (cookie: string, channel = 'Streamer'): Promise<RoomSummary> => {
+    const response = await call('POST', '/api/rooms', { channel }, cookie);
+    expect(response.statusCode).toBe(201);
+    return response.json<{ room: RoomSummary }>().room;
+  };
+
+  const connect = async (hello: Record<string, unknown>, headers: Record<string, string> = {}) => {
+    const client = await TestClient.connect(wsUrl, headers);
     clients.push(client);
     client.send({ type: 'hello', ...hello });
     return client;
@@ -138,103 +191,202 @@ describe('HTTP + WebSocket API', () => {
   afterEach(async () => {
     for (const client of clients.splice(0)) client.close();
     await app.close();
-    await registry.shutdown();
+    registry.shutdown();
+    db.close();
   });
 
-  describe('REST', () => {
+  describe('accounts', () => {
     beforeEach(() => setup());
 
-    it('reports health', async () => {
-      const response = await app.inject({ method: 'GET', url: '/healthz' });
-      expect(response.json()).toEqual({ status: 'ok', chatConnected: true, rooms: 0 });
-    });
-
-    it('creates rooms with a normalised channel and secret token', async () => {
-      const room = await createRoom('#MyChannel');
-      expect(room.channel).toBe('mychannel');
-      expect(room.roomId).toMatch(/^[\w-]{16}$/u);
-      expect(room.hostToken.length).toBeGreaterThanOrEqual(40);
-      const info = await app.inject({ method: 'GET', url: `/api/rooms/${room.roomId}` });
-      expect(info.json()).toEqual({ roomId: room.roomId, channel: 'mychannel' });
-    });
-
-    it('validates channel names', async () => {
-      const response = await app.inject({
-        method: 'POST',
-        url: '/api/rooms',
-        payload: { channel: 'no spaces!' },
+    it('registers with a secure, HttpOnly session cookie', async () => {
+      const response = await call('POST', '/api/auth/register', {
+        username: 'NewUser',
+        password: 'a good password',
       });
-      expect(response.statusCode).toBe(400);
-      expect(response.json()).toMatchObject({ code: 'bad_request' });
-    });
-
-    it('returns 404 for unknown rooms', async () => {
-      const response = await app.inject({ method: 'GET', url: '/api/rooms/doesnotexist' });
-      expect(response.statusCode).toBe(404);
-    });
-
-    it('enforces the room limit', async () => {
-      await createRoom('one_1');
-      await createRoom('two_2');
-      await createRoom('three_3');
-      const response = await app.inject({
-        method: 'POST',
-        url: '/api/rooms',
-        payload: { channel: 'four_4' },
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toEqual({ user: { id: 1, username: 'NewUser' } });
+      const cookie = response.cookies[0];
+      expect(cookie).toMatchObject({
+        name: 'hc_session',
+        httpOnly: true,
+        sameSite: 'Lax',
+        path: '/',
       });
-      expect(response.statusCode).toBe(503);
+    });
+
+    it('validates registration input', async () => {
+      const short = await call('POST', '/api/auth/register', {
+        username: 'ok_name',
+        password: 'short',
+      });
+      expect(short.statusCode).toBe(400);
+      expect(short.json<{ error: string }>().error).toMatch(/at least 10/u);
+      const badName = await call('POST', '/api/auth/register', {
+        username: 'no spaces',
+        password: 'a good password',
+      });
+      expect(badName.statusCode).toBe(400);
+    });
+
+    it('rejects duplicate usernames with 409', async () => {
+      await register('taken');
+      const response = await call('POST', '/api/auth/register', {
+        username: 'TAKEN',
+        password: 'another password',
+      });
+      expect(response.statusCode).toBe(409);
+    });
+
+    it('signs in, reports the current user and signs out', async () => {
+      await register('carol', 'carols password');
+      const bad = await call('POST', '/api/auth/login', { username: 'carol', password: 'nope' });
+      expect(bad.statusCode).toBe(401);
+
+      const login = await call('POST', '/api/auth/login', {
+        username: 'Carol',
+        password: 'carols password',
+      });
+      expect(login.statusCode).toBe(200);
+      const session = login.cookies[0];
+      const cookie = `${session?.name ?? ''}=${session?.value ?? ''}`;
+      expect((await call('GET', '/api/auth/me', undefined, cookie)).json()).toEqual({
+        user: { id: 1, username: 'carol' },
+      });
+
+      const logout = await call('POST', '/api/auth/logout', undefined, cookie);
+      expect(logout.statusCode).toBe(204);
+      expect((await call('GET', '/api/auth/me', undefined, cookie)).statusCode).toBe(401);
+    });
+
+    it('changes the password', async () => {
+      const cookie = await register('dana', 'first password');
+      const wrong = await call(
+        'POST',
+        '/api/auth/password',
+        { currentPassword: 'nope', newPassword: 'second password' },
+        cookie,
+      );
+      expect(wrong.statusCode).toBe(401);
+      const ok = await call(
+        'POST',
+        '/api/auth/password',
+        { currentPassword: 'first password', newPassword: 'second password' },
+        cookie,
+      );
+      expect(ok.statusCode).toBe(204);
+      const login = await call('POST', '/api/auth/login', {
+        username: 'dana',
+        password: 'second password',
+      });
+      expect(login.statusCode).toBe(200);
+    });
+
+    it('blocks cross-site state-changing requests', async () => {
+      const evil = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { origin: 'https://evil.example' },
+        payload: { username: 'a', password: 'b' },
+      });
+      expect(evil.statusCode).toBe(403);
+      const missing = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'a', password: 'b' },
+      });
+      expect(missing.statusCode).toBe(403);
+    });
+
+    it('requires sign-in for game management', async () => {
+      expect((await call('GET', '/api/rooms')).statusCode).toBe(401);
+      expect((await call('POST', '/api/rooms', { channel: 'abc' })).statusCode).toBe(401);
     });
 
     it('sets security headers', async () => {
-      const response = await app.inject({ method: 'GET', url: '/healthz' });
+      const response = await call('GET', '/healthz');
       expect(response.headers['content-security-policy']).toContain("default-src 'self'");
       expect(response.headers['x-content-type-options']).toBe('nosniff');
     });
   });
 
-  describe('access control', () => {
-    it('requires the access code when configured', async () => {
-      await setup({ accessCode: 'letmein' });
-      expect((await app.inject({ method: 'GET', url: '/api/config' })).json()).toEqual({
-        accessCodeRequired: true,
+  describe('registration settings', () => {
+    it('can be closed', async () => {
+      await setup({ registrationEnabled: false });
+      expect((await call('GET', '/api/config')).json()).toEqual({
+        registrationOpen: false,
+        registrationCodeRequired: false,
       });
-      const denied = await app.inject({
-        method: 'POST',
-        url: '/api/rooms',
-        payload: { channel: 'abc' },
+      const response = await call('POST', '/api/auth/register', {
+        username: 'someone',
+        password: 'a good password',
       });
-      expect(denied.statusCode).toBe(401);
-      const allowed = await app.inject({
-        method: 'POST',
-        url: '/api/rooms',
-        payload: { channel: 'abc', accessCode: 'letmein' },
+      expect(response.statusCode).toBe(403);
+    });
+
+    it('can require a code', async () => {
+      await setup({ registrationCode: 'letmein' });
+      const denied = await call('POST', '/api/auth/register', {
+        username: 'someone',
+        password: 'a good password',
+      });
+      expect(denied.statusCode).toBe(403);
+      const allowed = await call('POST', '/api/auth/register', {
+        username: 'someone',
+        password: 'a good password',
+        registrationCode: 'letmein',
       });
       expect(allowed.statusCode).toBe(201);
     });
+  });
 
-    it('restricts channels when configured', async () => {
-      await setup({ allowedChannels: ['allowed'] });
-      const denied = await app.inject({
-        method: 'POST',
-        url: '/api/rooms',
-        payload: { channel: 'other' },
+  describe('games', () => {
+    it('creates, lists and deletes games per account', async () => {
+      await setup();
+      const alice = await register('alice');
+      const bob = await register('bob');
+      const room = await createRoom(alice, '#MyChannel');
+      expect(room.channel).toBe('mychannel');
+
+      const again = await call('POST', '/api/rooms', { channel: 'mychannel' }, alice);
+      expect(again.statusCode).toBe(200);
+      expect(again.json<{ room: RoomSummary }>().room.roomId).toBe(room.roomId);
+
+      expect((await call('GET', '/api/rooms', undefined, alice)).json()).toMatchObject({
+        rooms: [{ roomId: room.roomId }],
       });
-      expect(denied.statusCode).toBe(403);
-      const allowed = await app.inject({
-        method: 'POST',
-        url: '/api/rooms',
-        payload: { channel: 'Allowed' },
-      });
-      expect(allowed.statusCode).toBe(201);
+      expect((await call('GET', '/api/rooms', undefined, bob)).json()).toEqual({ rooms: [] });
+
+      expect((await call('DELETE', `/api/rooms/${room.roomId}`, undefined, bob)).statusCode).toBe(
+        404,
+      );
+      expect((await call('DELETE', `/api/rooms/${room.roomId}`, undefined, alice)).statusCode).toBe(
+        204,
+      );
+    });
+
+    it('validates channels and enforces limits', async () => {
+      await setup({ allowedChannels: ['allowed', 'second'], maxRoomsPerUser: 1 });
+      const cookie = await register();
+      expect((await call('POST', '/api/rooms', { channel: 'no spaces!' }, cookie)).statusCode).toBe(
+        400,
+      );
+      expect((await call('POST', '/api/rooms', { channel: 'other' }, cookie)).statusCode).toBe(403);
+      await createRoom(cookie, 'allowed');
+      expect((await call('POST', '/api/rooms', { channel: 'second' }, cookie)).statusCode).toBe(
+        409,
+      );
     });
   });
 
   describe('WebSocket game flow', () => {
     beforeEach(() => setup());
 
+    const hostHeaders = (cookie: string) => ({ cookie, origin });
+
     it('plays a full round, hiding the target from the overlay until reveal', async () => {
-      const room = await createRoom();
-      const host = await connect({ role: 'host', roomId: room.roomId, token: room.hostToken });
+      const cookie = await register();
+      const room = await createRoom(cookie);
+      const host = await connect({ role: 'host', roomId: room.roomId }, hostHeaders(cookie));
       const overlay = await connect({ role: 'overlay', roomId: room.roomId });
       await host.next((m) => m.type === 'welcome');
       await overlay.next((m) => m.type === 'welcome');
@@ -275,8 +427,9 @@ describe('HTTP + WebSocket API', () => {
     });
 
     it('reports invalid commands without dropping the connection', async () => {
-      const room = await createRoom();
-      const host = await connect({ role: 'host', roomId: room.roomId, token: room.hostToken });
+      const cookie = await register();
+      const room = await createRoom(cookie);
+      const host = await connect({ role: 'host', roomId: room.roomId }, hostHeaders(cookie));
       await host.next((m) => m.type === 'welcome');
       host.send({ type: 'closeGuessing' });
       expect(await host.next((m) => m.type === 'error')).toMatchObject({ code: 'invalid_state' });
@@ -286,10 +439,29 @@ describe('HTTP + WebSocket API', () => {
       await host.nextState((s) => s.phase === 'picking');
     });
 
-    it('rejects a bad host token', async () => {
-      const room = await createRoom();
-      const host = await connect({ role: 'host', roomId: room.roomId, token: 'x'.repeat(43) });
-      expect(await host.waitForClose()).toBe(4401);
+    it('requires a signed-in host', async () => {
+      const cookie = await register();
+      const room = await createRoom(cookie);
+      const anonymous = await connect({ role: 'host', roomId: room.roomId }, { origin });
+      expect(await anonymous.waitForClose()).toBe(4401);
+    });
+
+    it('rejects hosts connecting from another site', async () => {
+      const cookie = await register();
+      const room = await createRoom(cookie);
+      const hijack = await connect(
+        { role: 'host', roomId: room.roomId },
+        { cookie, origin: 'https://evil.example' },
+      );
+      expect(await hijack.waitForClose()).toBe(4401);
+    });
+
+    it('rejects hosts who do not own the game', async () => {
+      const owner = await register('owner');
+      const other = await register('other');
+      const room = await createRoom(owner);
+      const intruder = await connect({ role: 'host', roomId: room.roomId }, hostHeaders(other));
+      expect(await intruder.waitForClose()).toBe(4403);
     });
 
     it('rejects unknown rooms and malformed hellos', async () => {
@@ -300,7 +472,8 @@ describe('HTTP + WebSocket API', () => {
     });
 
     it('keeps overlays read-only', async () => {
-      const room = await createRoom();
+      const cookie = await register();
+      const room = await createRoom(cookie);
       const overlay = await connect({ role: 'overlay', roomId: room.roomId });
       await overlay.next((m) => m.type === 'welcome');
       overlay.send({ type: 'drawCard' });
@@ -308,7 +481,8 @@ describe('HTTP + WebSocket API', () => {
     });
 
     it('releases the chat channel when clients disconnect', async () => {
-      const room = await createRoom();
+      const cookie = await register();
+      const room = await createRoom(cookie);
       const overlay = await connect({ role: 'overlay', roomId: room.roomId });
       await overlay.next((m) => m.type === 'welcome');
       overlay.close();

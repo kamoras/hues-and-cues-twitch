@@ -11,16 +11,19 @@ export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'failed'
 
 export interface GameSocketHandlers<State> {
   onState(state: State, serverTime: number): void;
-  onStatus?(status: ConnectionStatus, detail?: string): void;
+  onStatus?(status: ConnectionStatus, detail?: string, closeCode?: number): void;
   onChatStatus?(connected: boolean): void;
   onError?(message: string): void;
 }
 
 /** Close codes after which retrying is pointless. Mirrors the server's CloseCode. */
+export const UNAUTHORIZED_CLOSE_CODE = 4401;
+
 const FATAL_CLOSE_CODES = new Map<number, string>([
   [4400, 'The server rejected this client.'],
-  [4401, 'This control link is no longer valid.'],
-  [4404, 'This room no longer exists.'],
+  [UNAUTHORIZED_CLOSE_CODE, 'Please sign in again.'],
+  [4403, 'That game belongs to a different account.'],
+  [4404, 'This game no longer exists.'],
 ]);
 
 /**
@@ -86,7 +89,7 @@ export class GameSocket<State extends PublicGameState | HostGameState> {
       const fatal = FATAL_CLOSE_CODES.get(event.code);
       if (fatal !== undefined) {
         this.closed = true;
-        this.handlers.onStatus?.('failed', fatal);
+        this.handlers.onStatus?.('failed', fatal, event.code);
         return;
       }
       if (!this.closed) this.scheduleRetry();

@@ -1,6 +1,8 @@
-# Production stack: the game server behind Caddy, which obtains and renews
-# HTTPS certificates automatically. Usage:
-#   cp .env.example .env   # set DOMAIN and ACCESS_CODE
+# Standalone stack for hosting on a machine of your own: the game server
+# behind its own Caddy, which obtains HTTPS certificates automatically.
+# (Production on the shared Oracle VM uses deploy/docker-compose.yml instead.)
+# Usage:
+#   cp .env.example .env   # set DOMAIN (and REGISTRATION_CODE)
 #   docker compose up -d --build
 services:
   app:
